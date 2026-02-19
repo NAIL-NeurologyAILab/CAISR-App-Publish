@@ -18,24 +18,58 @@
 
 ## 🛠 Prerequisites
 
-Unlike the Docker version, this source version requires a local Python environment with specific dependencies.
+## 🛠 Prerequisites & Environment Setup
 
-1.  **Python**: Python 3.9+ is recommended.
-2.  **Dependencies**: The pipeline is split into "Core" (Deep Learning/Processing) and "Analysis" (Metrics/Stats).
+Because CAISR is a modular system adapted from distinct Docker containers, each module (Stage, Arousal, Resp, Limb) operates on specific dependencies. To ensure reproducibility, **you must create separate Conda environments for each task.**
 
+**1. Install Anaconda or Miniconda**
+Ensure you have [Conda](https://docs.conda.io/en/latest/) installed.
+
+**2. Create Environments**
+
+Run the following commands to set up the specific environments.
+
+#### A. Sleep Staging (`caisr_stage`)
+The staging module uses a specific environment file located in the `stage/` folder.
 ```bash
-# Create environment
-conda create -n caisr python=3.9
-conda activate caisr
-
-# Install dependencies
-pip install -r requirements_core.txt      # For stage, arousal, resp, limb
-pip install -r requirements_analysis.txt  # For metrics and inter-rater analysis
+cd stage
+conda env create -f caisr_stage.yml
+# This creates an environment named 'caisr_stage'
+cd ..
 ```
 
-**System Requirements**:
-*   A machine with **16GB+ RAM** is recommended.
-*   **GPU** support (NVIDIA CUDA) is recommended for the Staging and Arousal modules to improve processing speed, though they will run on CPU.
+#### B. Arousal Detection (`caisr_arousal`)
+```bash
+conda create -n caisr_arousal python=3.9 -y
+conda activate caisr_arousal
+pip install -r arousal/arousal_requirements.txt
+conda deactivate
+```
+
+#### C. Respiratory Analysis (`caisr_resp`)
+```bash
+conda create -n caisr_resp python=3.9 -y
+conda activate caisr_resp
+pip install -r resp/resp_requirements.txt
+conda deactivate
+```
+
+#### D. Limb Movement (`caisr_limb`)
+```bash
+conda create -n caisr_limb python=3.9 -y
+conda activate caisr_limb
+pip install -r limb/limb_requirements.txt
+conda deactivate
+```
+
+#### E. Analysis & Metrics (`caisr_analysis`)
+For the `combine`, `metrics`, and `interrater` scripts.
+```bash
+conda create -n caisr_analysis python=3.10 -y
+conda activate caisr_analysis
+pip install -r requirements_analysis.txt
+conda deactivate
+```
 
 ---
 
@@ -46,7 +80,6 @@ The system requires the following structure to function correctly:
 ```text
 CAISR-App/
 ├── README.md
-├── requirements_core.txt
 ├── requirements_analysis.txt
 ├── caisr_stage.py          # Sleep Staging Script
 ├── caisr_arousal.py        # Arousal Detection Script
@@ -112,54 +145,83 @@ def save_prepared_data(path, signal_dataframe):
 
 ---
 
-## 🚀 Usage Pipeline
+## 🚀 Usage
 
-The scripts are designed to be run sequentially.
+**Important:** You must activate the corresponding Conda environment before running a specific task.
 
 ### 1. Sleep Staging
-Runs GraphSleepNet to predict sleep stages (N3, N2, N1, R, W).
+**Environment:** `caisr_stage`
 ```bash
+conda activate caisr_stage
 python caisr_stage.py \
   --input_data_dir ./my_dataset/h5 \
   --output_csv_dir ./caisr_output \
-  --model_dir ./stage/graphsleepnet/models \
+  --model_dir ./stage/models \
   --param_dir ./data
+conda deactivate
 ```
 
 ### 2. Arousal Detection
-Detects cortical arousals (requires staging output).
+**Environment:** `caisr_arousal`
 ```bash
+conda activate caisr_arousal
 python caisr_arousal.py \
   --input_data_dir ./my_dataset/h5 \
   --output_csv_dir ./caisr_output \
   --param_dir ./data
+conda deactivate
 ```
 
 ### 3. Respiratory Analysis
-Detects Apnea, Hypopnea, and RERAs.
+**Environment:** `caisr_resp`
 ```bash
+conda activate caisr_resp
 python caisr_resp.py \
   --input_data_dir ./my_dataset/h5 \
   --output_csv_dir ./caisr_output \
   --param_dir ./data
+conda deactivate
 ```
 
 ### 4. Limb Movement Detection
-Detects leg movements and PLMs.
+**Environment:** `caisr_limb`
 ```bash
+conda activate caisr_limb
 python caisr_limb.py \
   --input_data_dir ./my_dataset/h5 \
   --output_csv_dir ./caisr_output \
   --param_dir ./data
+conda deactivate
 ```
 
 ### 5. Combining Results
-Aggregates individual task outputs into unified CSVs per subject.
+**Environment:** `caisr_analysis`
+Aggregates the individual outputs into one CSV per subject.
 ```bash
+conda activate caisr_analysis
 python caisr_combine.py \
   --input_data_dir ./my_dataset/h5 \
   --caisr_output_dir ./caisr_output \
   --cohort_name MyStudyCohort
+```
+
+### 6. Clinical Metrics
+**Environment:** `caisr_analysis`
+```bash
+python caisr_metrics.py \
+  --input_dir ./caisr_output/combined/MyStudyCohort \
+  --output_dir ./caisr_results \
+  --cohort_name MyStudyCohort
+```
+
+### 7. Inter-Rater Analysis
+**Environment:** `caisr_analysis`
+```bash
+python caisr_interrater.py stage resp\
+  --cohort_name MyStudyCohort \
+  --caisr_dir /path/to/caisr/combined \
+  --expert_dir /path/to/original/h5_files \
+  --output_dir /path/to/results
 ```
 
 ---
