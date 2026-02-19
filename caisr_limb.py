@@ -1,0 +1,228 @@
+"""
+CAISR Limb: Limb Movement Detection
+Author: Samaneh Nasiri, PhD
+Cleaned/Refactored for Public Repository
+
+Description:
+    Runs limb movement detection logic (PLM/LM) on EMG channels.
+"""
+
+import os
+import sys
+import glob
+import time
+import argparse
+import multiprocessing
+import numpy as np
+import pandas as pd
+from scipy import signal
+from scipy.signal import resample_poly
+from typing import List, Tuple
+
+sys.path.insert(1, './limb')
+from utils_limb import *
+from utils_docker import *
+
+def timer(tag: str) -> None:
+    print(tag)
+    for i in range(1, len(tag) + 1):
+        print('.' * i + '     ', end='\r')
+        time.sleep(1.5 / len(tag))
+    print()
+
+def extract_run_parameters(param_path: str) -> Tuple[bool, int]:
+    if not os.path.exists(param_path):
+        return False, 1 # Default
+    params = pd.read_csv(param_path)
+    overwrite = params['overwrite'].values[0]
+    val = params.get('multiprocess', pd.Series([False])).values[0]
+    
+    if str(val).lower() == 'true': workers = 0
+    elif str(val).lower() == 'false': workers = 1
+    else:
+        try: workers = int(val)
+        except: workers = 1
+    return overwrite, workers
+
+def set_output_paths(input_paths: List[str], csv_folder: str, overwrite: bool) -> Tuple[List[str], List[str]]:
+    limb_out_dir = os.path.join(csv_folder, 'limb')
+    os.makedirs(limb_out_dir, exist_ok=True)
+    
+    IDs = [p.split(os.sep)[-1].split('.')[0] for p in input_paths]
+    csv_paths = [os.path.join(limb_out_dir, f'{ID}_limb.csv') for ID in IDs]
+    input_paths, csv_paths = filter_already_processed_files(input_paths, csv_paths, overwrite)
+    return input_paths, csv_paths
+
+def filter_already_processed_files(input_paths: List[str], csv_paths: List[str], overwrite: bool) -> Tuple[List[str], List[str]]:
+    total = len(input_paths)
+    if not overwrite:
+        todo_indices = [i for i, path in enumerate(csv_paths) if not os.path.exists(path)]
+        input_paths = np.array(input_paths)[todo_indices].tolist()
+        csv_paths = np.array(csv_paths)[todo_indices].tolist()
+        processed_count = total - len(todo_indices)
+    else:
+        processed_count = 0
+
+    tag = '(overwrite)' if overwrite else ''
+    print(f'>> {processed_count}/{total} files already processed\n>> {len(input_paths)} to go.. {tag}\n')
+    return input_paths, csv_paths
+
+def create_empty_output(total_samples, save_path):
+    print(' - Creating empty limb movement file.')
+    fs_input = 200 
+    num_epochs = total_samples // fs_input
+    zeros_1hz = np.zeros(num_epochs, dtype=int)
+    ones_1hz = np.ones(num_epochs, dtype=float)
+    t1 = (np.arange(num_epochs) * fs_input).astype(int)
+    t2 = ((np.arange(num_epochs) + 1) * fs_input).astype(int)
+    
+    df = pd.DataFrame({
+        'start_idx': t1, 'end_idx': t2, 'limb': zeros_1hz, 'plm': zeros_1hz,
+        'prob_no': ones_1hz, 'prob_limb': zeros_1hz.astype(float)
+    })
+    df.to_csv(save_path, index=False)
+
+def process_single_limb_file(path: str, save_path: str, file_info: Tuple[int, int]):
+    num, total_files = file_info
+    the_id = path.split(os.sep)[-1].split('.')[0]
+    tag = the_id if len(the_id) < 21 else the_id[:20] + '..'
+    print(f'(# {num + 1}/{total_files}) Processing "{tag}" [PID:{os.getpid()}]')
+    
+    try:
+        EMGs, Fs = select_signals_cohort(path)
+        if EMGs is None or np.all(EMGs == 0):
+            print(f' - EMG empty for "{tag}".')
+            # Assuming standard length if file load fails is tricky, but here we assume Fs=200
+            # Ideally select_signals_cohort returns length even if signals are flat.
+            return 
+            
+        new_Fs = 100
+        emg_signal_resampled = resample_poly(EMGs, new_Fs, Fs) if new_Fs != Fs else EMGs
+    except Exception as e:
+        print(f'ERROR loading signals for "{the_id}": {e}')
+        return
+    
+    signal_emg = np.array(emg_signal_resampled.T) * 1e6
+    sample_rate = 100
+
+    lower_threshold_uV = 2
+    upper_threshold_uV = 10
+    min_duration_sec = 0.5
+    max_duration_sec = 10.0
+    filter_hp_freq_Hz = 15
+    sliding_window_len_sec = 0.5
+    filter_order = 100
+    merge_lm_within_sec = 0.5
+
+    all_channels_lm_events = []
+    num_chns = signal_emg.shape[0]
+
+    for ch in range(num_chns):
+        b = signal.firwin(filter_order + 1, filter_hp_freq_Hz / (sample_rate / 2), pass_zero=False)
+        delay = int(filter_order / 2)
+        LM_line = signal.lfilter(b, 1, signal_emg[ch, :], axis=0)
+        LM_line = np.concatenate((np.abs(LM_line[delay:]), np.zeros(delay)))
+        
+        LM_above_thresh_high = np.where(LM_line >= upper_threshold_uV)[0]
+        if len(LM_above_thresh_high) == 0:
+            continue
+
+        window_len = int(sliding_window_len_sec * sample_rate)
+        max_dur = int(max_duration_sec * sample_rate)
+        avg_LM_line = signal.lfilter(np.ones(window_len) / window_len, 1, LM_line)
+
+        LM_below_thresh_low = LM_above_thresh_high.copy()
+        last_crossed_index = 0
+        for k in range(len(LM_above_thresh_high)):
+            start = LM_above_thresh_high[k] + 1
+            if start > last_crossed_index:
+                cand = np.where(avg_LM_line[start : start + max_dur] < lower_threshold_uV)[0]
+                if len(cand) > 0:
+                    LM_below_thresh_low[k] = start + cand[0]
+                    last_crossed_index = LM_below_thresh_low[k]
+        
+        LM_candidates = np.column_stack((LM_above_thresh_high, LM_below_thresh_low))
+        lm_dur = LM_candidates[:, 1] - LM_candidates[:, 0]
+        LM_dur_range = np.ceil(np.array([min_duration_sec, max_duration_sec]) * sample_rate)
+        valid_indices = np.where((lm_dur >= LM_dur_range[0]) & (lm_dur <= LM_dur_range[1]))[0]
+        LM_candidates = LM_candidates[valid_indices]
+
+        if len(LM_candidates) > 0:
+            min_samples = int(round(merge_lm_within_sec * sample_rate))
+            # FIX: Correctly call merge_nearby_events and extract the first element
+            LM_candidates = merge_nearby_events(LM_candidates, min_samples)
+            LM_candidates = LM_candidates[0]
+            all_channels_lm_events.extend(LM_candidates.tolist())
+
+    if not all_channels_lm_events:
+        print(f" - No valid limb movements found for {tag}.")
+        create_empty_output(EMGs.shape[0], save_path)
+        return
+
+    final_lm_events = np.array(all_channels_lm_events)
+    final_lm_events = final_lm_events[final_lm_events[:, 0].argsort()]
+    min_samples = int(round(merge_lm_within_sec * sample_rate))
+    # FIX: Correctly call merge_nearby_events and extract the first element here as well
+    final_lm_events = merge_nearby_events(final_lm_events, min_samples)
+    final_lm_events = final_lm_events[0]
+
+    PLM_events = []
+    if len(final_lm_events) >= 4:
+        PLM_min_interval_sec = 5
+        PLM_max_interval_sec = 90
+        PLM_min_LM_req = 4
+        PLM_candidates = np.zeros(len(final_lm_events), dtype=bool)
+        interval = np.diff(final_lm_events[:, 0]) / sample_rate
+        is_in_range = (interval >= PLM_min_interval_sec) & (interval <= PLM_max_interval_sec)
+        for i in range(len(is_in_range) - (PLM_min_LM_req - 2)):
+            if np.all(is_in_range[i : i + PLM_min_LM_req - 1]):
+                PLM_candidates[i : i + PLM_min_LM_req] = True
+        PLM_events = final_lm_events[PLM_candidates]
+
+    LM_binary = np.zeros(emg_signal_resampled.shape[0])
+    for start, end in final_lm_events:
+        LM_binary[start:end+1] = 1
+    
+    PLM_binary = np.zeros(emg_signal_resampled.shape[0])
+    for start, end in PLM_events:
+        PLM_binary[start:end+1] = 1
+    
+    fs_input = 200
+    LM_binary_resampled = resample_poly(LM_binary, fs_input, new_Fs)
+    PLM_binary_resampled = resample_poly(PLM_binary, fs_input, new_Fs)
+    
+    LM_1Hz_matrix = reshape_array(LM_binary_resampled, window_size=fs_input)
+    PLM_1Hz_matrix = reshape_array(PLM_binary_resampled, window_size=fs_input)
+
+    majority_LM = (np.sum(LM_1Hz_matrix, axis=1) > fs_input / 2).astype(int)
+    majority_PLM = (np.sum(PLM_1Hz_matrix, axis=1) > fs_input / 2).astype(int)
+
+    one_hot_labels = np.eye(2)[majority_LM]
+    
+    t1 = (np.arange(len(majority_LM)) * fs_input).astype(int)
+    t2 = ((np.arange(len(majority_LM)) + 1) * fs_input).astype(int)
+    
+    df = pd.DataFrame({
+        'start_idx': t1, 'end_idx': t2, 'limb': majority_LM, 'plm': majority_PLM,
+        'prob_no': one_hot_labels[:, 0], 'prob_limb': one_hot_labels[:, 1]
+    })
+    df.to_csv(save_path, index=False)
+
+def process_limb_dispatcher(in_paths: List[str], save_paths: List[str], worker_count: int):
+    if not in_paths:
+        print(">> No files to process.")
+    else:
+        num_workers = min(os.cpu_count(), len(in_paths)) if worker_count == 0 else worker_count
+        
+        tasks = [(path, save_path, (num, len(in_paths))) for num, (path, save_path) in enumerate(zip(in_paths, save_paths))]
+
+        if num_workers > 1:
+            print(f">> Multiprocessing enabled ({num_workers} workers).")
+            with multiprocessing.Pool(processes=num_workers) as pool:
+                pool.starmap(process_single_limb_file, tasks)
+        else:
+            print(">> Sequential processing.")
+            for task in tasks:
+                process_single_limb_file(*task)
+
+    timer('* Finishing "caisr_limb"')
